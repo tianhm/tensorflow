@@ -1,4 +1,4 @@
-load("@llvm-project//mlir:tblgen.bzl", "gentbl_cc_library")
+load("@llvm-project//mlir:tblgen.bzl", "gentbl_cc_library", "td_library")
 load("@local_config_cuda//cuda:build_defs.bzl", "if_cuda")
 load("@local_config_rocm//rocm:build_defs.bzl", "if_rocm_is_configured")
 load("@local_tsl//tsl/platform/default:cuda_build_defs.bzl", "if_cuda_is_configured")
@@ -166,15 +166,21 @@ cc_library(
     hdrs = ["triton_fusion_emitter_legacy_matmul.h"],
     deps = [
         ":emitter_helpers",
+        "//xla:comparison_util",
         "//xla:shape_util",
         "//xla:status_macros",
+        "//xla:util",
         "//xla/hlo/ir:hlo",
         "//xla/hlo/utils:hlo_query",
+        "//xla/mlir_hlo",
+        "//xla/mlir_hlo:map_mhlo_to_scalar_op",
+        "//xla/mlir_hlo:transformation_helpers",
         "//xla/service:algorithm_util",
         "//xla/service/gpu:hlo_traversal",
         "//xla/service/gpu:ir_emission_utils",
         "//xla/service/gpu:launch_dimensions",
         "//xla/service/gpu:matmul_utils",
+        "//xla/service/gpu:target_util",
         "//xla/service/gpu:triton_fusion_analysis",
         "//xla/service/gpu:triton_tiling_propagation",
         "//xla/service/gpu/model:tiled_hlo_instruction_or_computation",
@@ -188,9 +194,12 @@ cc_library(
         "@com_google_absl//absl/log:check",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:cord",
         "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/types:span",
         "@llvm-project//llvm:Support",
+        "@llvm-project//llvm:ir_headers",
         "@llvm-project//mlir:ArithDialect",
         "@llvm-project//mlir:IR",
         "@llvm-project//mlir:MathDialect",
@@ -308,6 +317,78 @@ cc_library(
     ],
 )
 
+td_library(
+    name = "xla_triton_ops_td_files",
+    srcs = ["xla_triton_ops.td"],
+    includes = ["."],
+    deps = [
+        "@llvm-project//mlir:OpBaseTdFiles",
+        "@llvm-project//mlir:SideEffectInterfacesTdFiles",
+    ],
+)
+
+gentbl_cc_library(
+    name = "xla_triton_ops_inc_gen",
+    strip_include_prefix = ".",
+    tbl_outs = [
+        (
+            [
+                "-gen-op-decls",
+                "-dialect=triton_xla",
+            ],
+            "xla_triton_ops.h.inc",
+        ),
+        (
+            [
+                "-gen-op-defs",
+                "-dialect=triton_xla",
+            ],
+            "xla_triton_ops.cc.inc",
+        ),
+        (
+            [
+                "-gen-dialect-decls",
+                "-dialect=triton_xla",
+            ],
+            "xla_triton_dialect.h.inc",
+        ),
+        (
+            [
+                "-gen-dialect-defs",
+                "-dialect=triton_xla",
+            ],
+            "xla_triton_dialect.cc.inc",
+        ),
+    ],
+    tblgen = "@llvm-project//mlir:mlir-tblgen",
+    td_file = "xla_triton_ops.td",
+    deps = [
+        "@llvm-project//mlir:InferTypeOpInterfaceTdFiles",
+        "@llvm-project//mlir:OpBaseTdFiles",
+        "@llvm-project//mlir:SideEffectInterfacesTdFiles",
+        "@triton//:td_files",
+    ],
+)
+
+cc_library(
+    name = "xla_triton_ops",
+    srcs = ["xla_triton_ops.cc"],
+    hdrs = ["xla_triton_ops.h"],
+    deps = [
+        ":xla_triton_ops_inc_gen",
+        "@llvm-project//llvm:Support",
+        "@llvm-project//mlir:BytecodeOpInterface",
+        "@llvm-project//mlir:ControlFlowInterfaces",
+        "@llvm-project//mlir:IR",
+        "@llvm-project//mlir:InferTypeOpInterface",
+        "@llvm-project//mlir:SideEffectInterfaces",
+        "@triton//:TritonDialects",
+        "@triton//:triton_gpu_attr_inc_gen",
+        "@triton//:triton_gpu_types_inc_gen",
+        "@triton//:triton_ops_inc_gen",
+    ],
+)
+
 xla_test(
     name = "triton_fusion_emitter_device_legacy_test",
     srcs = if_gpu_is_configured(["triton_fusion_emitter_device_legacy_test.cc"]),
@@ -406,6 +487,7 @@ cc_library(
         "//xla/backends/profiler/gpu:cupti_collector",
         "//xla/backends/profiler/gpu:cupti_tracer",
         "//xla/tsl/profiler/utils:time_utils",
+        "@com_google_absl//absl/algorithm:container",
     ],
 )
 
