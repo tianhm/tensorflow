@@ -78,10 +78,10 @@ limitations under the License.
 #include "mlir/Target/LLVMIR/Export.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "xla/backends/cpu/codegen/cpu_features.h"
-#include "xla/backends/cpu/codegen/function_library.h"
 #include "xla/backends/cpu/codegen/ir_compiler.h"
 #include "xla/backends/cpu/codegen/jit_compiler.h"
 #include "xla/backends/cpu/codegen/target_machine_features.h"
+#include "xla/backends/cpu/runtime/function_library.h"
 #include "xla/backends/cpu/runtime/thunk.h"
 #include "xla/cpu_function_runtime.h"
 #include "xla/hlo/analysis/hlo_ordering.h"
@@ -473,10 +473,6 @@ void AddHloVerifier(HloPassPipeline* pipeline, HloVerifierOpts&& opts = {},
 absl::Status CpuCompiler::RunHloPassesThroughLayoutAssn(
     HloModule* module, bool is_aot_compile,
     TargetMachineFeatures* target_machine_features, bool is_mlir_compile) {
-  HloPassPipeline pre_sharding_pipeline("pre-spmd-pipeline");
-  // TODO(b/359982037): Run BatchedGatherScatterNormalizer after partitioning.
-  pre_sharding_pipeline.AddPass<BatchedGatherScatterNormalizer>();
-  TF_RETURN_IF_ERROR(pre_sharding_pipeline.Run(module).status());
   const int64_t num_partitions = module->config().num_partitions();
   if (num_partitions > 1) {
     if (!module->config().use_spmd_partitioning()) {
@@ -522,7 +518,7 @@ absl::Status CpuCompiler::RunHloPassesThroughLayoutAssn(
   }
   HloPassPipeline pipeline("HLO passes through layout assignment");
   AddHloVerifier(&pipeline);
-
+  pipeline.AddPass<BatchedGatherScatterNormalizer>();
   pipeline.AddPass<ResultCaster>();
   pipeline.AddPass<OperandUpcaster>();
 
@@ -607,6 +603,10 @@ absl::Status CpuCompiler::RunHloPassesThroughLayoutAssn(
   pipeline.AddPass<FloatNormalization>(&f8e4m3fnuz_support);
   FloatSupport f8e3m4_support(F8E3M4, F16);
   pipeline.AddPass<FloatNormalization>(&f8e3m4_support);
+  FloatSupport s4_support(S4, S8);
+  pipeline.AddPass<FloatNormalization>(&s4_support);
+  FloatSupport u4_support(U4, U8);
+  pipeline.AddPass<FloatNormalization>(&u4_support);
   // After canonicalization, there may be more batch dots that can be
   // simplified.
   pipeline.AddPass<BatchDotSimplification>();
@@ -1359,7 +1359,7 @@ CpuCompiler::CompileLegacyCpuExecutable(std::unique_ptr<HloModule> module) {
 
   // Options for compiling LLVM IR to machine code.
   IrCompiler::Options ir_compiler_options{
-      /*optimization_level=*/static_cast<int32_t>(CodeGenOptLevel(config)),
+      /*optimization_level=*/CodeGenOptLevel(config),
       /*optimize_for_size=*/options::OptimizeForSizeRequested(config),
       /*fast_math_flags=*/llvm_ir::GetCpuFastMathFlags(config),
       /*disable_expensive_passes=*/
@@ -1393,7 +1393,6 @@ CpuCompiler::CompileLegacyCpuExecutable(std::unique_ptr<HloModule> module) {
   TF_ASSIGN_OR_RETURN(
       JitCompiler jit_compiler,
       JitCompiler::Create(CompilerTargetOptions(module->config()),
-                          CodeGenOptLevel(module->config()),
                           std::move(jit_compiler_options),
                           GetCompilationTaskRunner()));
 
@@ -1571,16 +1570,16 @@ CpuCompiler::CompileLegacyCpuExecutable(std::unique_ptr<HloModule> module) {
     }
 
     // Collect compiled symbols from all LLVM module parts.
-    using Kernel = std::remove_pointer_t<Thunk::FunctionRegistry::Kernel>;
-    using Cmp = std::remove_pointer_t<Thunk::FunctionRegistry::Comparator>;
     std::vector<FunctionLibrary::Symbol> compiled_symbols;
 
     for (const CompiledSymbolsPart& part : compiled_parts) {
       for (const IrEmitter2::KernelInfo& kernel : part.kernels) {
-        compiled_symbols.push_back(FunctionLibrary::Sym<Kernel>(kernel.name));
+        compiled_symbols.push_back(
+            FunctionLibrary::Sym<FunctionLibrary::Kernel>(kernel.name));
       }
       for (const IrEmitter2::ComparatorInfo& comparator : part.comparators) {
-        compiled_symbols.push_back(FunctionLibrary::Sym<Cmp>(comparator.name));
+        compiled_symbols.push_back(
+            FunctionLibrary::Sym<FunctionLibrary::Comparator>(comparator.name));
       }
     }
 
@@ -1925,7 +1924,7 @@ CpuCompiler::CompileAheadOfTime(std::unique_ptr<HloModuleGroup> module_group,
       };
 
       IrCompiler::Options ir_compiler_options = {
-          /*optimization_level=*/static_cast<int>(opt_level),
+          /*optimization_level=*/opt_level,
           /*optimize_for_size=*/
           options::OptimizeForSizeRequested(module->config()),
           /*fast_math_flags=*/llvm_ir::GetCpuFastMathFlags(module->config()),
@@ -2058,7 +2057,7 @@ CpuExecutableAotCompilationResult::LoadExecutable(
 
   // Options for compiling LLVM IR to machine code.
   IrCompiler::Options ir_compiler_options{
-      /*optimization_level=*/static_cast<int32_t>(CodeGenOptLevel(config)),
+      /*optimization_level=*/CodeGenOptLevel(config),
       /*optimize_for_size=*/options::OptimizeForSizeRequested(config),
       /*fast_math_flags=*/llvm_ir::GetCpuFastMathFlags(config),
       /*disable_expensive_passes=*/
@@ -2088,9 +2087,7 @@ CpuExecutableAotCompilationResult::LoadExecutable(
   TF_ASSIGN_OR_RETURN(
       JitCompiler jit_compiler,
       JitCompiler::Create(CompilerTargetOptions(module->config()),
-                          CodeGenOptLevel(module->config()),
-                          std::move(jit_compiler_options),
-                          /*task_runner=*/nullptr));
+                          std::move(jit_compiler_options)));
 
   // We might have an XLA:CPU executable that has only runtime thunks and
   // doesn't have any corresponding object files, and it's absolutely fine.
@@ -2138,15 +2135,15 @@ CpuExecutableAotCompilationResult::LoadExecutable(
                         thunk_emitter.EmitEntryComputation(*module));
 
     // Collect compiled symbols from IrEmitter2.
-    using Kernel = std::remove_pointer_t<Thunk::FunctionRegistry::Kernel>;
-    using Cmp = std::remove_pointer_t<Thunk::FunctionRegistry::Comparator>;
     std::vector<FunctionLibrary::Symbol> compiled_symbols;
 
     for (const auto& kernel : ir_emitter2.kernels()) {
-      compiled_symbols.push_back(FunctionLibrary::Sym<Kernel>(kernel.name));
+      compiled_symbols.push_back(
+          FunctionLibrary::Sym<FunctionLibrary::Kernel>(kernel.name));
     }
     for (const auto& comparator : ir_emitter2.comparators()) {
-      compiled_symbols.push_back(FunctionLibrary::Sym<Cmp>(comparator.name));
+      compiled_symbols.push_back(
+          FunctionLibrary::Sym<FunctionLibrary::Comparator>(comparator.name));
     }
 
     VLOG(3) << "Collected " << compiled_symbols.size() << " compiled symbols";
