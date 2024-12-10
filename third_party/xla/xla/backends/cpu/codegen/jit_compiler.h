@@ -40,8 +40,8 @@ limitations under the License.
 #include "llvm/Support/CodeGen.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/Target/TargetOptions.h"
-#include "xla/backends/cpu/codegen/function_library.h"
 #include "xla/backends/cpu/codegen/ir_compiler.h"
+#include "xla/backends/cpu/runtime/function_library.h"
 #include "tsl/platform/cpu_info.h"
 
 namespace xla::cpu {
@@ -112,9 +112,8 @@ class JitCompiler {
 
   // Creates a new instance of the JitCompiler.
   static absl::StatusOr<JitCompiler> Create(llvm::TargetOptions target_options,
-                                            llvm::CodeGenOptLevel opt_level,
                                             Options options,
-                                            TaskRunner task_runner);
+                                            TaskRunner task_runner = nullptr);
 
   // Adds a LLVM module to the dynamic library at `dylib_index`.
   absl::Status AddModule(llvm::orc::ThreadSafeModule module,
