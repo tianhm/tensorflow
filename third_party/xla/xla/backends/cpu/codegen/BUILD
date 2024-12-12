@@ -10,7 +10,7 @@ load("//xla/tsl/platform:rules_cc.bzl", "cc_library")
 
 package(
     # copybara:uncomment default_applicable_licenses = ["//tensorflow:license"],
-    default_visibility = [":friends"],
+    default_visibility = ["//xla/backends/cpu:xla_backend_cpu_internal_access"],
     licenses = ["notice"],
 )
 
@@ -52,18 +52,6 @@ cc_library(
 )
 
 cc_library(
-    name = "function_library",
-    srcs = ["function_library.cc"],
-    hdrs = ["function_library.h"],
-    deps = [
-        "//xla:util",
-        "//xla/tsl/lib/gtl:int_type",
-        "@com_google_absl//absl/status:statusor",
-        "@local_tsl//tsl/platform:statusor",
-    ],
-)
-
-cc_library(
     name = "ir_compiler",
     srcs = ["ir_compiler.cc"],
     hdrs = ["ir_compiler.h"],
@@ -96,9 +84,9 @@ cc_library(
     deps = [
         ":contiguous_section_memory_manager",
         ":cpu_features",
-        ":function_library",
         ":ir_compiler",
         "//xla:util",
+        "//xla/backends/cpu/runtime:function_library",
         "//xla/service/cpu:orc_jit_memory_mapper",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/container:flat_hash_map",
@@ -138,9 +126,9 @@ xla_cc_test(
     name = "jit_compiler_test",
     srcs = ["jit_compiler_test.cc"],
     deps = [
-        ":function_library",
         ":jit_compiler",
         "//xla:util",
+        "//xla/backends/cpu/runtime:function_library",
         "//xla/tsl/lib/core:status_test_util",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
@@ -209,5 +197,19 @@ cc_library(
         "@com_google_absl//absl/types:span",
         "@llvm-project//llvm:Core",
         "@llvm-project//llvm:Support",
+    ],
+)
+
+cc_library(
+    name = "kernel_api_ir_builder",
+    srcs = ["kernel_api_ir_builder.cc"],
+    hdrs = ["kernel_api_ir_builder.h"],
+    deps = [
+        "//xla:cpu_function_runtime",
+        "//xla:shape_util",
+        "//xla/service/llvm_ir:ir_array",
+        "//xla/service/llvm_ir:llvm_util",
+        "@com_google_absl//absl/strings",
+        "@llvm-project//llvm:ir_headers",
     ],
 )
