@@ -891,8 +891,9 @@ PjRtStreamExecutorClient::BufferFromHostBufferInternal(
   // Allocating multigigabyte pinned buffers can be very slow. In that case,
   // using a staging buffer is probably worse than not using one.
   // TODO(phawkins): add chunking for transfers.
-  if (must_use_staging_buffer || (should_stage_host_to_device_transfers() &&
-                                  packed_size < (int64_t{1} << 30))) {
+  if (!IsDmaMapped(data, packed_size) &&
+      (must_use_staging_buffer || (should_stage_host_to_device_transfers() &&
+                                   packed_size < (int64_t{1} << 30)))) {
     void* ptr = host_memory_allocator()->AllocateRaw(
         tsl::Allocator::kAllocatorAlignment, transpose ? size : packed_size);
     staging_buffer = std::shared_ptr<void>(
@@ -1186,50 +1187,7 @@ PjRtStreamExecutorClient::MakeCrossHostReceiveBuffers(
   }
 
   TF_RETURN_IF_ERROR(EnqueueCrossHostReceive(
-      buffers, std::move(definition_event), std::move(notifier), std::nullopt));
-  return buffers;
-}
-
-absl::StatusOr<std::vector<std::unique_ptr<PjRtBuffer>>>
-PjRtStreamExecutorClient::MakeCrossHostReceiveBuffersForGather(
-    absl::Span<const Shape> shapes, std::vector<GatherDetails> gather_details,
-    PjRtDevice* device, PjRtCrossHostRecvNotifier notifier) {
-  VLOG(2) << "Making " << gather_details.size()
-          << " cross host receive buffers for gather";
-  if (gather_details.empty()) {
-    return InvalidArgument(
-        "gather_details parameter empty in "
-        "MakeCrossHostReceiveBuffersForGather");
-  }
-
-  if (shapes.size() != gather_details.size()) {
-    return InvalidArgument(
-        "gather_details parameter has length %lld but shapes "
-        "parameter has length %lld in "
-        "MakeCrossHostReceiveBuffersForGather",
-        gather_details.size(), shapes.size());
-  }
-
-  TF_ASSIGN_OR_RETURN(LocalDeviceState * local_device,
-                      tensorflow::down_cast<PjRtStreamExecutorDevice*>(device)
-                          ->GetLocalDeviceState());
-  std::shared_ptr<BufferSequencingEvent> definition_event =
-      std::make_shared<BufferSequencingEvent>(this->thread_pool());
-  std::vector<std::unique_ptr<PjRtBuffer>> buffers;
-  buffers.reserve(shapes.size());
-  for (int i = 0; i < shapes.size(); ++i) {
-    TF_ASSIGN_OR_RETURN(
-        std::unique_ptr<PjRtBuffer> buffer,
-        AllocateDestinationBuffer(shapes[i], device, local_device,
-                                  /*copy_stream=*/nullptr,
-                                  /*is_uninitialized_create=*/false, this,
-                                  definition_event));
-    buffers.push_back(std::move(buffer));
-  }
-
-  TF_RETURN_IF_ERROR(
-      EnqueueCrossHostReceive(buffers, std::move(definition_event),
-                              std::move(notifier), gather_details));
+      buffers, std::move(definition_event), std::move(notifier)));
   return buffers;
 }
 
@@ -1274,6 +1232,40 @@ PjRtStreamExecutorClient::CreateViewOfDeviceBuffer(
   return std::unique_ptr<PjRtBuffer>(std::make_unique<PjRtStreamExecutorBuffer>(
       shape, std::move(device_buffer), this, device,
       device->default_memory_space().value_or(nullptr)));
+}
+
+absl::Status PjRtStreamExecutorClient::DmaMap(void* data, size_t buffer_size) {
+  tsl::profiler::TraceMe trace_me("PjRtStreamExecutorClient::DmaMap");
+  TF_ASSIGN_OR_RETURN(
+      LocalDeviceState * local_device,
+      tensorflow::down_cast<PjRtStreamExecutorDevice*>(devices_[0])
+          ->GetLocalDeviceState());
+  bool success = local_device->compute_stream()->parent()->HostMemoryRegister(
+      data, buffer_size);
+  if (!success) {
+    return absl::InternalError(absl::StrFormat(
+        "Failed to register host memory at address: %ps", data));
+  }
+  absl::MutexLock lock(&dma_maps_mutex_);
+  dma_maps_.insert({data, buffer_size});
+  return absl::OkStatus();
+}
+
+absl::Status PjRtStreamExecutorClient::DmaUnmap(void* data) {
+  tsl::profiler::TraceMe trace_me("PjRtStreamExecutorClient::DmaUnmap");
+  TF_ASSIGN_OR_RETURN(
+      LocalDeviceState * local_device,
+      tensorflow::down_cast<PjRtStreamExecutorDevice*>(devices_[0])
+          ->GetLocalDeviceState());
+  bool success =
+      local_device->compute_stream()->parent()->HostMemoryUnregister(data);
+  if (!success) {
+    return absl::InternalError(absl::StrFormat(
+        "Failed to unregister host memory at address: %ps", data));
+  }
+  absl::MutexLock lock(&dma_maps_mutex_);
+  dma_maps_.erase(data);
+  return absl::OkStatus();
 }
 
 // Transfer the given literal to the infeed queue of the given local device.
@@ -1993,22 +1985,6 @@ void PjRtStreamExecutorBuffer::CopyToRemoteDevice(
     client_->CopyToRemoteDevice(this, *desc, std::move(on_done));
   } else {
     on_done(desc.status(), /*sends_enqueued=*/false);
-  }
-}
-
-void PjRtStreamExecutorBuffer::CopyToRemoteDeviceScattered(
-    PjRtFuture<std::vector<std::string>> serialized_descriptors,
-    std::vector<RemoteSendCallback> callbacks,
-    const ScatterDetails& scatter_details) {
-  VLOG(1) << "PjRtStreamExecutorBuffer::CopyToRemoteDeviceScattered";
-  auto res = serialized_descriptors.Await();
-  if (res.ok()) {
-    client_->CopyToRemoteDeviceScattered(this, *std::move(res),
-                                         std::move(callbacks), scatter_details);
-  } else {
-    for (const auto& cb : callbacks) {
-      cb(res.status(), /*sends_enqueued=*/false);
-    }
   }
 }
 
@@ -3144,10 +3120,9 @@ PjRtStreamExecutorLoadedExecutable::Execute(
         *hlo_inputs.add_arguments() = literal->ToProto();
       }
       *hlo_snapshot.add_partitions() = std::move(hlo_inputs);
-
-      DumpHloUnoptimizedSnapshotIfEnabled(
-          hlo_snapshot, input_hlo_snapshot_bits_->debug_options);
     }
+    DumpHloUnoptimizedSnapshotIfEnabled(
+        hlo_snapshot, input_hlo_snapshot_bits_->debug_options);
   }
 
   RunId run_id;
@@ -3733,6 +3708,21 @@ PjRtStreamExecutorClient::LoadSerializedExecutable(
     absl::string_view serialized, std::optional<CompileOptions> options,
     const LoadOptions& load_options) {
   return DeserializeExecutable(serialized, options);
+}
+
+bool PjRtStreamExecutorClient::IsDmaMapped(const void* data_start,
+                                           int64_t transfer_size) {
+  absl::MutexLock lock(&dma_maps_mutex_);
+  if (!dma_maps_.empty()) {
+    void* data_end = (char*)data_start + transfer_size;
+    for (const auto& [map_start, map_size] : dma_maps_) {
+      void* map_end = (char*)map_start + map_size;
+      if (data_start >= map_start && data_end <= map_end) {
+        return true;
+      }
+    }
+  }
+  return false;
 }
 
 }  // namespace xla

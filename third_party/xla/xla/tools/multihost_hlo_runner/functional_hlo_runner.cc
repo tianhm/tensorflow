@@ -43,7 +43,6 @@ limitations under the License.
 #include "xla/hlo/ir/hlo_input_output_alias_config.h"
 #include "xla/hlo/ir/hlo_module.h"
 #include "xla/hlo/ir/hlo_sharding.h"
-#include "xla/hlo/parser/hlo_parser.h"
 #include "xla/hlo/pass/hlo_pass_pipeline.h"
 #include "xla/hlo/translate/hlo_to_mhlo/translate.h"
 #include "xla/hlo/translate/stablehlo.h"
@@ -58,23 +57,27 @@ limitations under the License.
 #include "xla/pjrt/pjrt_future.h"
 #include "xla/pjrt/pjrt_layout.h"
 #include "xla/primitive_util.h"
+#include "xla/runtime/large_hlo_snapshot_serialization/serialization.h"
 #include "xla/service/computation_layout.h"
 #include "xla/service/computation_placer.h"
 #include "xla/service/hlo.pb.h"
 #include "xla/service/hlo_module_config.h"
-#include "xla/service/hlo_runner_interface.h"
+#include "xla/service/hlo_module_util.h"
 #include "xla/shape_util.h"
 #include "xla/status_macros.h"
 #include "xla/tests/test_utils.h"
 #include "xla/tools/hlo_control_flow_flattening.h"
 #include "xla/tsl/platform/env.h"
 #include "xla/tsl/platform/errors.h"
+#include "xla/tsl/platform/file_system.h"
+#include "xla/tsl/platform/file_system_helper.h"
 #include "xla/tsl/platform/status.h"
 #include "xla/tsl/platform/statusor.h"
 #include "xla/tsl/util/fixed_option_set_flag.h"
 #include "xla/util.h"
 #include "xla/xla.pb.h"
 #include "xla/xla_data.pb.h"
+#include "tsl/platform/protobuf.h"
 #include "tsl/profiler/lib/profiler_session.h"
 #include "tsl/profiler/protobuf/profiler_options.pb.h"
 #include "tsl/profiler/protobuf/xplane.pb.h"
@@ -169,14 +172,6 @@ GetModuleOutputModeParser() {
   return parser;
 }
 
-absl::StatusOr<std::unique_ptr<HloModule>> ReadModuleFromTextProtoFile(
-    absl::string_view hlo_file) {
-  HloProto proto;
-  TF_RETURN_IF_ERROR(
-      tsl::ReadTextProto(tsl::Env::Default(), std::string(hlo_file), &proto));
-  return HloRunnerInterface::CreateModuleFromProto(proto.hlo_module());
-}
-
 absl::StatusOr<HloModuleAndArguments> ReadModuleFromSnapshotBinaryProtoFile(
     absl::string_view hlo_file) {
   HloSnapshot proto;
@@ -189,21 +184,27 @@ absl::StatusOr<HloModuleAndArguments> ReadModuleFromSnapshotBinaryProtoFile(
     TF_ASSIGN_OR_RETURN(hlo_module_and_arguments.arguments.front()[i],
                         Literal::CreateFromProto(proto.arguments()[i]));
   }
-  TF_ASSIGN_OR_RETURN(
-      hlo_module_and_arguments.hlo_module,
-      HloRunnerInterface::CreateModuleFromProto(proto.hlo().hlo_module()));
+  TF_ASSIGN_OR_RETURN(hlo_module_and_arguments.hlo_module,
+                      CreateModuleFromProto(proto.hlo().hlo_module()));
   return hlo_module_and_arguments;
 }
 
 absl::StatusOr<HloModuleAndArguments>
 ReadModuleFromUnoptimizedSnapshotBinaryProtoFile(absl::string_view hlo_file) {
-  HloUnoptimizedSnapshot proto;
   HloModuleAndArguments hlo_module_and_arguments;
-  TF_RETURN_IF_ERROR(
-      tsl::ReadBinaryProto(tsl::Env::Default(), std::string(hlo_file), &proto));
-  TF_ASSIGN_OR_RETURN(
-      hlo_module_and_arguments.hlo_module,
-      HloRunnerInterface::CreateModuleFromProto(proto.hlo_module()));
+  tsl::Env* env = tsl::Env::Default();
+
+  std::unique_ptr<tsl::RandomAccessFile> file;
+  TF_RETURN_IF_ERROR(env->NewRandomAccessFile(std::string(hlo_file), &file));
+
+  tsl::RandomAccessFileCopyingInputStream input_stream(file.get());
+  tsl::protobuf::io::CopyingInputStreamAdaptor adaptor(&input_stream);
+
+  TF_ASSIGN_OR_RETURN(HloUnoptimizedSnapshot proto,
+                      DeserializeHloUnoptimizedSnapshot(&adaptor));
+
+  TF_ASSIGN_OR_RETURN(hlo_module_and_arguments.hlo_module,
+                      CreateModuleFromProto(proto.hlo_module()));
 
   for (const auto& arguments : proto.partitions()) {
     hlo_module_and_arguments.arguments.emplace_back();
@@ -224,9 +225,8 @@ ReadModuleFromUnoptimizedSnapshotTextProtoFile(absl::string_view hlo_file) {
   HloModuleAndArguments hlo_module_and_arguments;
   TF_RETURN_IF_ERROR(
       tsl::ReadTextProto(tsl::Env::Default(), std::string(hlo_file), &proto));
-  TF_ASSIGN_OR_RETURN(
-      hlo_module_and_arguments.hlo_module,
-      HloRunnerInterface::CreateModuleFromProto(proto.hlo_module()));
+  TF_ASSIGN_OR_RETURN(hlo_module_and_arguments.hlo_module,
+                      CreateModuleFromProto(proto.hlo_module()));
 
   for (const auto& arguments : proto.partitions()) {
     hlo_module_and_arguments.arguments.emplace_back();
@@ -509,9 +509,8 @@ FunctionalHloRunner::LoadHloModuleAndArguments(absl::string_view hlo_file,
   HloModuleAndArguments hlo_module_and_arguments;
   switch (input_format) {
     case InputFormat::kText: {
-      TF_ASSIGN_OR_RETURN(
-          hlo_module_and_arguments.hlo_module,
-          HloRunnerInterface::ReadModuleFromHloTextFile(hlo_file));
+      TF_ASSIGN_OR_RETURN(hlo_module_and_arguments.hlo_module,
+                          ReadModuleFromHloTextFile(hlo_file));
       break;
     }
     case InputFormat::kProtoText: {
@@ -520,9 +519,8 @@ FunctionalHloRunner::LoadHloModuleAndArguments(absl::string_view hlo_file,
       break;
     }
     case InputFormat::kProtoBinary: {
-      TF_ASSIGN_OR_RETURN(
-          hlo_module_and_arguments.hlo_module,
-          HloRunnerInterface::ReadModuleFromBinaryProtoFile(hlo_file));
+      TF_ASSIGN_OR_RETURN(hlo_module_and_arguments.hlo_module,
+                          ReadModuleFromBinaryProtoFile(hlo_file));
       break;
     }
     case InputFormat::kSnapshotProtoBinary: {

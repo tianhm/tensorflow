@@ -7,12 +7,7 @@ load("//tensorflow/lite/experimental/litert/build_common:special_rule.bzl", "gle
 
 package(
     # copybara:uncomment default_applicable_licenses = ["//tensorflow:license"],
-    default_visibility = [
-        # copybara:uncomment "//third_party/mediapipe/calculators/tensor:__subpackages__",
-        # copybara:uncomment "//third_party/odml/infra:__subpackages__",
-        # copybara:uncomment "//third_party/odml/litert:__subpackages__",
-        "//tensorflow/lite/experimental/litert:__subpackages__",
-    ],
+    default_visibility = ["//visibility:public"],
 )
 
 cc_library(
@@ -351,6 +346,7 @@ cc_test(
         ":litert_accelerator_options",
         ":litert_common",
         "//tensorflow/lite/experimental/litert/core:accelerator",
+        "//tensorflow/lite/experimental/litert/test:matchers",
         "@com_google_googletest//:gtest_main",
     ],
 )
@@ -386,6 +382,7 @@ cc_library(
     hdrs = ["litert_accelerator_registration.h"],
     deps = [
         ":litert_accelerator",
+        ":litert_accelerator_options",
         ":litert_common",
         ":litert_compiled_model",
         "//tensorflow/lite/experimental/litert/cc:litert_expected",
@@ -399,9 +396,9 @@ cc_test(
     srcs = ["litert_accelerator_registration_test.cc"],
     deps = [
         ":litert_accelerator",
+        ":litert_accelerator_options",
         ":litert_accelerator_registration",
         ":litert_common",
-        ":litert_compiled_model",
         ":litert_environment",
         "//tensorflow/lite/experimental/litert/core:accelerator",
         "@com_google_googletest//:gtest_main",

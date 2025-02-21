@@ -58,6 +58,7 @@ limitations under the License.
 #include "xla/pjrt/gpu/gpu_helpers.h"
 #include "xla/pjrt/gpu/gpu_topology.h"
 #include "xla/pjrt/gpu/gpu_topology.pb.h"
+#include "xla/pjrt/gpu/se_gpu_topology_description.h"
 #include "xla/pjrt/host_memory_spaces.h"
 #include "xla/pjrt/local_device_state.h"
 #include "xla/pjrt/pjrt_client.h"
@@ -337,7 +338,9 @@ class AsyncHostToDeviceTransferManager
     auto* client =
         tensorflow::down_cast<PjRtStreamExecutorClient*>(device_->client());
     bool should_stage_host_to_device_transfers =
-        client->should_stage_host_to_device_transfers();
+        client->should_stage_host_to_device_transfers() &&
+        (!client->IsDmaMapped(data, transfer_size));
+
     std::shared_ptr<void> staging_buffer;
     if (should_stage_host_to_device_transfers) {
       auto* host_memory_allocator = client->host_memory_allocator();
@@ -697,11 +700,12 @@ PjRtFuture<> StreamExecutorGpuClient::CopyRawSubBufferToHost(
     WaitForBufferDefinitionEventsOnStream(*device_buffer, stream);
 
     if (transfer_size != 0) {
-      if (should_stage_host_to_device_transfers()) {
+      if (should_stage_host_to_device_transfers() &&
+          !IsDmaMapped(dst.value(), transfer_size)) {
         if (host_memory_allocator() == nullptr) {
-          promise.Set(InvalidArgument(
-              "host_memory_allocator should be initialized for staging buffer "
-              "transfer."));
+          promise.Set(
+              InvalidArgument("host_memory_allocator should be initialized for "
+                              "staging buffer transfer."));
           return;
         }
         void* ptr = host_memory_allocator()->AllocateRaw(
@@ -1306,21 +1310,6 @@ absl::StatusOr<std::unique_ptr<PjRtClient>> GetStreamExecutorGpuClient(
       options.node_id, std::move(allocator), std::move(host_memory_allocator),
       options.should_stage_host_to_device_transfers, std::move(gpu_run_options),
       std::move(kv_store), std::move(gpu_topology)));
-}
-
-absl::StatusOr<std::string> StreamExecutorGpuTopologyDescription::Serialize()
-    const {
-  std::string result;
-  if (!tsl::SerializeToStringDeterministic(gpu_topology_->ToProto(), &result)) {
-    return absl::InternalError("Failed to serialize gpu_topology");
-  }
-  return result;
-}
-
-absl::StatusOr<Layout> StreamExecutorGpuTopologyDescription::GetDefaultLayout(
-    PrimitiveType element_type, absl::Span<const int64_t> dims) const {
-  Shape shape = ShapeUtil::MakeShape(element_type, dims);
-  return LayoutUtil::GetWithDefaultLayout(shape).layout();
 }
 
 std::vector<std::unique_ptr<PjRtStreamExecutorDevice>> BuildLocalDevices(

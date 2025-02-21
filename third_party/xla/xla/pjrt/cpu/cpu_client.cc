@@ -15,6 +15,8 @@ limitations under the License.
 
 #include "xla/pjrt/cpu/cpu_client.h"
 
+#include "xla/pjrt/plugin/xla_cpu/cpu_execute_options.h"
+
 #define EIGEN_USE_THREADS
 
 #include <algorithm>
@@ -1513,14 +1515,32 @@ absl::StatusOr<PjRtLoadedExecutable::Result> TfrtCpuExecutable::ExecuteHelper(
 
   ExecutableRunOptions run_options;
   run_options.set_run_id(run_id);
-  run_options.set_device_ordinal(device->id());
   // Need to keep device_assignment alive until execution completes.
   run_options.set_device_assignment(device_assignment.get());
   run_options.set_intra_op_thread_pool(client_->eigen_intraop_device());
 
   auto cpu_run_options = std::make_shared<cpu::CpuExecutableRunOptions>();
-  cpu_run_options->set_collectives(client_->collectives_.get());
   run_options.set_cpu_executable_run_options(cpu_run_options.get());
+
+  const CpuExecuteContext* cpu_execute_context =
+      options.context == nullptr
+          ? nullptr
+          : dynamic_cast<const CpuExecuteContext*>(options.context);
+  if (cpu_execute_context != nullptr &&
+      cpu_execute_context->process_index().has_value()) {
+    run_options.set_device_ordinal(
+        PackCpuDeviceId(*cpu_execute_context->process_index(),
+                        UnpackCpuLocalDeviceId(device->global_device_id()))
+            .value());
+  } else {
+    run_options.set_device_ordinal(device->global_device_id().value());
+  }
+  if (cpu_execute_context != nullptr &&
+      cpu_execute_context->collectives() != nullptr) {
+    cpu_run_options->set_collectives(cpu_execute_context->collectives());
+  } else {
+    cpu_run_options->set_collectives(client_->collectives_.get());
+  }
 
   // Schedule only one collective at a time.
   bool is_a_collective_launch = !!last_collective_launch_event;
@@ -1889,16 +1909,13 @@ TfrtCpuExecutable::Execute(
     absl::Span<const std::vector<PjRtBuffer*>> argument_handles,
     const ExecuteOptions& options,
     std::optional<std::vector<PjRtFuture<>>>& returned_futures) {
-  tsl::profiler::TraceMe traceme("TfrtCpuExecutable::Execute");
-  if (device_assignment_ == nullptr) {
-    return InvalidArgument("Execute expects a non-null device_assignment");
-  }
-
-  RunId run_id;
+  RunId run_id(options.launch_id);
   tsl::profiler::TraceMeProducer activity("TfrtCpuExecutable::Execute",
                                           tsl::profiler::ContextType::kPjRt,
                                           run_id.ToInt());
-
+  if (device_assignment_ == nullptr) {
+    return InvalidArgument("Execute expects a non-null device_assignment");
+  }
   const int num_addressable_devices = addressable_devices_.size();
 
   if (argument_handles.size() != num_addressable_devices) {
@@ -2012,7 +2029,10 @@ TfrtCpuExecutable::ExecuteSharded(
     absl::Span<PjRtBuffer* const> argument_handles, PjRtDevice* device,
     const ExecuteOptions& options, std::optional<PjRtFuture<>>& returned_future,
     bool fill_future) {
-  tsl::profiler::TraceMe traceme("TfrtCpuExecutable::ExecuteSharded");
+  RunId run_id(options.launch_id);
+  tsl::profiler::TraceMeProducer activity("TfrtCpuExecutable::ExecuteSharded",
+                                          tsl::profiler::ContextType::kPjRt,
+                                          run_id.ToInt());
   if (device_assignment_ == nullptr) {
     return InvalidArgument("ExecuteShard expects a non-null device_assignment");
   }
@@ -2025,7 +2045,7 @@ TfrtCpuExecutable::ExecuteSharded(
           auto result,
           ExecuteHelper(
               argument_handles, addressable_device_logical_ids_[i].replica,
-              addressable_device_logical_ids_[i].partition, RunId(), options,
+              addressable_device_logical_ids_[i].partition, run_id, options,
               /*last_collective_launch_event=*/
               tsl::AsyncValueRef<CpuEvent>(), fill_future));
       returned_future = std::move(result.future);
@@ -2043,7 +2063,10 @@ TfrtCpuExecutable::ExecutePortable(
     absl::Span<PjRtBuffer* const> argument_handles, PjRtDevice* device,
     const ExecuteOptions& options, std::optional<PjRtFuture<>>& returned_future,
     bool fill_future) {
-  tsl::profiler::TraceMe traceme("TfrtCpuExecutable::ExecutePortable");
+  RunId run_id(options.launch_id);
+  tsl::profiler::TraceMeProducer activity("TfrtCpuExecutable::ExecutePortable",
+                                          tsl::profiler::ContextType::kPjRt,
+                                          run_id.ToInt());
   if (device_assignment_ != nullptr) {
     return InvalidArgument("ExecutePortable gets a non-portable executable");
   }
@@ -2063,7 +2086,7 @@ TfrtCpuExecutable::ExecutePortable(
       ExecuteHelper(
           argument_handles,
           /*replica=*/0,
-          /*partition=*/0, RunId(), options,
+          /*partition=*/0, run_id, options,
           /*last_collective_launch_event=*/tsl::AsyncValueRef<CpuEvent>(),
           fill_future, tensorflow::down_cast<TfrtCpuDevice*>(device)));
   returned_future = std::move(result.future);
